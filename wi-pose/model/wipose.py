@@ -20,6 +20,7 @@ class WifiPoseDataset(dataset):
     def pre_pipeline(self, results):
         results['seg_fields'] = []
         results['img_prefix'] = self.img_dir
+        
 
     def get_item_single_frame(self,index): 
         data_name = self.filename_list[index]
