@@ -5,113 +5,139 @@ Modules to compute the matching cost and solve the corresponding LSAP.
 import torch
 from scipy.optimize import linear_sum_assignment
 from torch import nn
-from torchvision.ops.boxes import box_area
-
+import numpy as np
 
 class HungarianMatcher(nn.Module):
-    def __init__(self, cost_class: float = 1, cost_bbox: float = 1, cost_giou: float = 1):
+    def __init__(self, cost_class: float = 100, cost_oks: float = 10, cost_kpt: float = 1):
         super().__init__()
         self.cost_class = cost_class
-        self.cost_bbox = cost_bbox
-        self.cost_giou = cost_giou
-        assert cost_class != 0 or cost_bbox != 0 or cost_giou != 0, "all costs cant be 0"
+        self.cost_oks = cost_oks
+        self.cost_kpt = cost_kpt
+        assert cost_class != 0 or cost_oks != 0 or cost_kpt != 0, "all costs cant be 0"
 
     @torch.no_grad()
     def forward(self, outputs, targets):
         bs, num_queries = outputs["pred_logits"].shape[:2]
-
-        # We flatten to compute the cost matrices in a batch
-        out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1).float()  # [batch_size * num_queries, num_classes]
-        out_bbox = outputs["pred_boxes"].flatten(0, 1).float()  # [batch_size * num_queries, 4]
-
-        # Also concat the target labels and boxes
+        out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1).float()
+        out_keypoint = outputs["pred_keypoints"].flatten(0, 1).float()
         tgt_ids = torch.cat([v["labels"] for v in targets])
-        tgt_bbox = torch.cat([v["boxes"] for v in targets]).float()
+        tgt_areas = torch.cat([v["areas"] for v in targets])
+        tgt_keypoint = torch.cat([v["keypoints"] for v in targets]).float()
+        tgt_keypoints_reshape = tgt_keypoint.reshape(tgt_keypoint.shape[0], -1, 3)  # [bs, 17, 3]
+        kpt_pred_tmp = out_keypoint.clone().detach().reshape(out_keypoint.shape[0], -1, 2)
+        normalized_gt_keypoints = tgt_keypoints_reshape[..., :2]  # Removed normalization factor
+        neg_cost = -(1 - out_prob + 1e-12).log() * (
+            1 - 0.25) * out_prob.pow(2)
+        pos_cost = -(out_prob + 1e-12).log() * 0.25 * (
+            1 - out_prob).pow(2)
+        cls_cost = pos_cost[:, tgt_ids] - neg_cost[:, tgt_ids]
+        cost_kpt = self.kpt_cost(kpt_pred_tmp, normalized_gt_keypoints)
 
-        # Compute the classification cost. Contrary to the loss, we don't use the NLL,
-        # but approximate it in 1 - proba[target class].
-        # The 1 is a constant that doesn't change the matching, it can be ommitted.
-        cost_class = -out_prob[:, tgt_ids]
+        kpt_pred_tmp = out_keypoint.clone().detach().reshape(out_keypoint.shape[0], -1, 2)
+        cost_oks = self.oks_cost(kpt_pred_tmp, normalized_gt_keypoints, tgt_areas) 
 
-        # Compute the L1 cost between boxes
-        cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
-
-        # Compute the giou cost betwen boxes
-        cost_giou = self.generalized_box_iou(self.box_cxcywh_to_xyxy(out_bbox),
-                                     self.box_cxcywh_to_xyxy(tgt_bbox))
-
-
-        # Final cost matrix
-        C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
+        C = self.cost_kpt * cost_kpt + self.cost_class * cls_cost + self.cost_oks * cost_oks
         C = C.view(bs, num_queries, -1).cpu()
-
-        sizes = [len(v["boxes"]) for v in targets]
+        sizes = [len(v["keypoints"]) for v in targets]
+        ##sizes = len(targets["keypoints"])
         indices = [linear_sum_assignment(c[i]) for i, c in enumerate(C.split(sizes, -1))]
         return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices]
+
+
+    def kpt_cost(self, kpt_pred, gt_keypoints):
+        kpt_cost = []
+        for i in range(len(gt_keypoints)):
+            kpt_pred_tmp = kpt_pred.clone()
+            valid_kpt_flag = torch.ones(len(gt_keypoints),17)
+            valid_flag = valid_kpt_flag[i] > 0
+            valid_flag_expand = valid_flag.unsqueeze(0).unsqueeze(
+                -1).expand_as(kpt_pred_tmp)
+            kpt_pred_tmp[~valid_flag_expand] = 0
+            cost = torch.cdist(
+                kpt_pred_tmp.reshape(kpt_pred_tmp.shape[0], -1),
+                gt_keypoints[i].reshape(-1).unsqueeze(0),
+                p=1)
+            avg_factor = torch.clamp(valid_flag.float().sum() * 2, 1.0)
+            cost = cost / avg_factor
+            kpt_cost.append(cost)
+        kpt_cost = torch.cat(kpt_cost, dim=1)
+        return kpt_cost
     
-    def box_cxcywh_to_xyxy(self,x):
-        x_c, y_c, w, h = x.unbind(-1)
-        b = [(x_c - 0.5 * w), (y_c - 0.5 * h),
-            (x_c + 0.5 * w), (y_c + 0.5 * h)]
-        return torch.stack(b, dim=-1)
-    
-    def generalized_box_iou(self,boxes1, boxes2):
+    def oks_cost(self, kpt_pred, gt_keypoints,gt_areas):
         """
-        Generalized IoU from https://giou.stanford.edu/
+        Args:
+            kpt_pred (Tensor): Predicted keypoints with unnormalized
+                coordinates (x_{i}, y_{i}). Shape [num_query, K, 2].
+            gt_keypoints (Tensor): Ground truth keypoints with unnormalized
+                coordinates (x_{i}, y_{i}). Shape [num_gt, K, 2].
+            valid_kpt_flag (Tensor): valid flag of ground truth keypoints.
+                Shape [num_gt, K].
+            gt_areas (Tensor): Ground truth mask areas. Shape [num_gt,].
 
-        The boxes should be in [x0, y0, x1, y1] format
-
-        Returns a [N, M] pairwise matrix, where N = len(boxes1)
-        and M = len(boxes2)
+        Returns:
+            torch.Tensor: oks_cost value with weight.
         """
-        # degenerate boxes gives inf / nan results
-        # so do an early check
-        assert (boxes1[:, 2:] >= boxes1[:, :2]).all()
-        assert (boxes2[:, 2:] >= boxes2[:, :2]).all()
-        iou , union = self.box_iou(boxes1,boxes2)
+        self.sigmas = np.array([
+                .26,
+                .25, .25,
+                .35, .35,
+                .79, .79,
+                .72, .72,
+                .62, .62,
+                1.07, 1.07,
+                .87, .87,
+                .89, .89], dtype=np.float32) / 10.0
+        sigmas = torch.from_numpy(self.sigmas).to(kpt_pred.device)
+        variances = (sigmas * 2)**2
 
-        lt = torch.min(boxes1[:, None, :2], boxes2[:, :2])
-        rb = torch.max(boxes1[:, None, 2:], boxes2[:, 2:])
+        oks_cost = []
+        for i in range(len(gt_keypoints)):
+            squared_distance = \
+                (kpt_pred[:, :, 0] - gt_keypoints[i, :, 0].unsqueeze(0)) ** 2 + \
+                (kpt_pred[:, :, 1] - gt_keypoints[i, :, 1].unsqueeze(0)) ** 2
+            valid_kpt_flag = torch.ones(len(gt_keypoints),17)
+            vis_flag = (valid_kpt_flag[i] > 0).int()
+            vis_ind = vis_flag.nonzero(as_tuple=False)[:, 0]
+            num_vis_kpt = vis_ind.shape[0]
+            assert num_vis_kpt > 0
+            area = gt_areas[i]
+            squared_distance0 = squared_distance / (area * variances * 2)
+            squared_distance0 = squared_distance0[:, vis_ind]
+            squared_distance1 = torch.exp(-squared_distance0).sum(
+                dim=1, keepdim=True)
+            oks = squared_distance1 / num_vis_kpt
+            oks_cost.append(-oks)
+        oks_cost = torch.cat(oks_cost, dim=1)
+        return oks_cost
+class Match():
+    def __init__(self):
+        pass
+    def keypoint_match(outputs, targets, indices):
+        src_keypoints = outputs['pred_keypoints']
+        src_logits = outputs['pred_logits']
+        tgt_ids = ([v["labels"] for v in targets])
+        target_keypoints = [v["keypoints"].float() for v in targets]
+        tgt_areas = ([v["areas"] for v in targets])
+        target_classes = torch.full(src_logits.shape[:2], 1,
+            dtype=torch.int64, device=src_logits.device)
+        pred = torch.empty(0)
+        tgt = torch.empty(0)
+        tgt_area = torch.empty(0)
+        for batch_idx, (pred_indices, target_indices) in enumerate(indices):
+            selected_targets1 = tgt_ids[batch_idx][target_indices]
+            target_classes[batch_idx][pred_indices] = selected_targets1
+            selected_preds = src_keypoints[batch_idx][pred_indices]
+            selected_targets = target_keypoints[batch_idx][target_indices]
+            selected_area = tgt_areas[batch_idx][target_indices]
+            pred = torch.cat([pred,selected_preds],dim=0)
+            tgt = torch.cat([tgt,selected_targets],dim=0)
+            tgt_area = torch.cat([tgt_area,selected_area],dim=0)
+        n = len(tgt)
+        tgt_keypoints = torch.zeros((n, 34), dtype=float)
+        for i in range(51):
+            if (i + 1) % 3 != 0: 
+                tgt_keypoints[:, i - (i // 3)] =tgt[:, i]
+        return src_logits, target_classes, pred, tgt_keypoints, tgt_area
 
-        wh = (rb - lt).clamp(min=0)  # [N,M,2]
-        area = wh[:, :, 0] * wh[:, :, 1]
-        
-        return iou - (area - union) / area
-    def box_iou(boxes1, boxes2):
-        area1 = box_area(boxes1)
-        area2 = box_area(boxes2)
-
-        lt = torch.max(boxes1[:, None, :2], boxes2[:, :2])  # [N,M,2]
-        rb = torch.min(boxes1[:, None, 2:], boxes2[:, 2:])  # [N,M,2]
-
-        wh = (rb - lt).clamp(min=0)  # [N,M,2]
-        inter = wh[:, :, 0] * wh[:, :, 1]  # [N,M]
-
-        union = area1[:, None] + area2 - inter
-
-        iou = inter / union
-        return iou, union
 
 
-
-def build_matcher(args):
-    return HungarianMatcher(cost_class=args.set_cost_class, cost_bbox=args.set_cost_bbox, cost_giou=args.set_cost_giou)
-
-outputs = {}
-outputs["pred_logits"] = torch.randn(1, 1, 100, 2) 
-outputs["pred_boxes"] = torch.randn(1, 1, 100, 4)
-outputs["pred_keypoints"] = torch.randn(1, 1, 100, 34)
-targets = [
-    {
-        "labels": torch.tensor([1]),  
-        "boxes": torch.tensor([[100, 50, 200, 150]]) 
-    },
-    {
-        "labels": torch.tensor([1]), 
-        "boxes": torch.tensor([[50, 30, 120, 180]]) 
-    },
-]
-matcher = HungarianMatcher(cost_class=1.0, cost_bbox=5.0, cost_giou=2.0)
-with torch.no_grad():
-    indices = matcher.forward(outputs, targets)
-print(indices)

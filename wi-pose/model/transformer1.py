@@ -17,8 +17,8 @@ from torch import nn, Tensor
 
 class Transformer(nn.Module):
 
-    def __init__(self, d_model=60, nhead=4, num_encoder_layers=6,
-                 num_decoder_layers=6, dim_feedforward=240, dropout=0.1,
+    def __init__(self, d_model=3000, nhead=4, num_encoder_layers=6,
+                 num_decoder_layers=6, dim_feedforward=12000, dropout=0.1,
                  activation="relu", normalize_before=False,
                  return_intermediate_dec=False):
         super().__init__()
@@ -47,11 +47,11 @@ class Transformer(nn.Module):
     def forward(self, src, mask, query_embed, pos_embed):
         # flatten NxCxHxW to HWxNxC
         bs, c, h, w = src.shape
+        src = src.permute(0, 2, 1, 3)
         src = src.flatten(2).permute(2, 0, 1)
         pos_embed = pos_embed.flatten(2).permute(2, 0, 1)
         query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
         mask = mask.flatten(1)
-
         tgt = torch.zeros_like(query_embed)
         memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
         hs = self.decoder(tgt, memory, memory_key_padding_mask=mask,
@@ -268,7 +268,19 @@ class TransformerDecoderLayer(nn.Module):
         return self.forward_post(tgt, memory, tgt_mask, memory_mask,
                                  tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos)
 
+class MLP(nn.Module):
+    """ Very simple multi-layer perceptron (also called FFN)"""
 
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
+        super().__init__()
+        self.num_layers = num_layers
+        h = [hidden_dim] * (num_layers - 1)
+        self.layers = nn.ModuleList(nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim]))
+
+    def forward(self, x):
+        for i, layer in enumerate(self.layers):
+            x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
+        return x
 def _get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
 
@@ -296,20 +308,3 @@ def _get_activation_fn(activation):
         return F.glu
     raise RuntimeError(F"activation should be relu/gelu, not {activation}.")
 
-model = Transformer()
-
-# Assuming your data is in torch tensors
-src = torch.randn(1, 60, 27, 50)
-mask = torch.ones(1,1350)
-query_embed = torch.randn(100, 60)
-pos_embed = torch.randn(1, 60, 27,50)
-output, memory = model(src, mask, query_embed, pos_embed)
-print(output.shape)
-linear_class = nn.Linear(in_features=60, out_features=2)
-linear_bbox = nn.Linear(in_features=60, out_features=4)
-linear_keypoint = nn.Linear(in_features=60, out_features=34)
-outputs = {}
-outputs["pred_logits"] = linear_class(output)
-outputs["pred_boxes"] = linear_bbox(output)
-outputs["pred_keypoints"] = linear_keypoint(output)
-print(outputs["pred_keypoints"].shape)
