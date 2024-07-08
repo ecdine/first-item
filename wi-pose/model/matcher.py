@@ -19,6 +19,9 @@ class HungarianMatcher(nn.Module):
     def forward(self, outputs, targets):
         bs, num_queries = outputs["pred_logits"].shape[:2]
         out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1).float()
+        #probas = outputs['pred_logits'].softmax(-1)[0, :, :-1]
+        #probas = probas.reshape(100)
+        #print(max(probas))
         out_keypoint = outputs["pred_keypoints"].flatten(0, 1).float()
         tgt_ids = torch.cat([v["labels"] for v in targets])
         tgt_areas = torch.cat([v["areas"] for v in targets])
@@ -121,8 +124,12 @@ class Match():
         target_classes = torch.full(src_logits.shape[:2], 1,
             dtype=torch.int64, device=src_logits.device)
         pred = torch.empty(0)
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        pred = pred.to(device=device)
         tgt = torch.empty(0)
+        tgt = tgt.to(device=device)
         tgt_area = torch.empty(0)
+        tgt_area =tgt_area.to(device=device)
         for batch_idx, (pred_indices, target_indices) in enumerate(indices):
             selected_targets1 = tgt_ids[batch_idx][target_indices]
             target_classes[batch_idx][pred_indices] = selected_targets1

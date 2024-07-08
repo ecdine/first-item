@@ -24,7 +24,7 @@ class PositionEmbeddingSine(nn.Module):
 
     def forward(self, tensor_list):
         x = tensor_list
-        mask = torch.ones(x.size(0), 27 , 50,dtype=int)
+        mask = torch.ones(x.size(0), 27 , 50,dtype=int,device=x.device)
         assert mask is not None
         not_mask = ~mask
         y_embed = not_mask.cumsum(1, dtype=torch.float32)
@@ -36,7 +36,6 @@ class PositionEmbeddingSine(nn.Module):
 
         dim_t = torch.arange(self.num_pos_feats, dtype=torch.float32, device=x.device)
         dim_t = self.temperature ** (2 * (torch.div(dim_t, 2, rounding_mode='trunc')) / self.num_pos_feats)
-
         pos_x = x_embed[:, :, :, None] / dim_t
         pos_y = y_embed[:, :, :, None] / dim_t
         pos_x = torch.stack((pos_x[:, :, :, 0::2].sin(), pos_x[:, :, :, 1::2].cos()), dim=4).flatten(3)
